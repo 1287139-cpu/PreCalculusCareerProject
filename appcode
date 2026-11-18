@@ -1,0 +1,854 @@
+
+import json
+import math
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+# ---------------------------------------------------------------------------
+# Helpers: Exact Decimal Money & Safe Formatting
+# ---------------------------------------------------------------------------
+TWO_PLACES = Decimal("0.01")
+
+
+def to_dec(val) -> Decimal:
+    return Decimal(str(val)).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+
+
+def fmt_money(val: Decimal) -> str:
+    d = to_dec(val)
+    return f"-${abs(d):,.2f}" if d < 0 else f"${d:,.2f}"
+
+
+# ---------------------------------------------------------------------------
+# Default State Initialization (PSY-2: Study Habits & Wellness Studio)
+# ---------------------------------------------------------------------------
+def get_default_state() -> dict:
+    return {
+        "team_id": "TEAM-PSYCHOLOGY",
+        "course": "Precalculus",
+        "pathway_id": "PSY-2",
+        "business_name": "Study habits and wellness education studio",
+        "selected_level": "Advanced",
+        "state_version": 1,
+        "snapshot_id": "SNAP-001",
+        "simulation_date": "2027-01-31",
+        "base_period": "Monthly",
+        "working_days": 20,
+        "currency": "USD",
+        "startup": {
+            "owner_contribution": "5000.00",
+            "equipment_assets": "700.00",
+            "pre_opening_expense": "1300.00",
+            "opening_inventory": "0.00",
+            "opening_cash": "3000.00",
+            "retained_earnings": "-1300.00",
+        },
+        "cash_balance": "3000.00",
+        "debt_balance": "0.00",
+        "inputs": {
+            "base_price": 30.0,
+            "D0": 70,
+            "staff_hours": 25.0,
+            "hours_per_unit": 0.5,
+            "program_seats": 50,
+            "completion_rate": 0.80,
+            "satisfaction_mean": 4.2,
+            "requested_demand": 70,
+            "own_marketing_cost": 0.0,
+            "refund_amount": 0.0,
+            "loan_principal": 0.0,
+            "interest_expense": 0.0,
+            "additional_capex": 0.0,
+            "new_owner_cash": 0.0,
+            "new_loan_cash": 0.0,
+        },
+        "variable_costs": {
+            "facilitator_delivery": 3.00,
+            "materials": 2.00,
+            "survey_processing": 1.00,
+        },
+        "fixed_costs": {
+            "venue": 200.00,
+            "software": 100.00,
+            "accessibility": 150.00,
+            "admin": 100.00,
+        },
+        "random_seed": 2027,
+        "processed_run_ids": [],
+        "launched_campaign_ids": [],
+        "campaigns": [],
+        "ledger": [],
+        "recommendations": [],
+        "decisions": [],
+        "practice_history": [],
+        "cross_course": {
+            "connection_1": {
+                "subject": "Psychology / Behavioral Science",
+                "concept": "Self-Reported Satisfaction vs. Demonstrated Learning & Completion",
+                "business_use": "Separating survey satisfaction (4.2/5) from actual program completion (80%) so we do not assume happy participants automatically mastered study habits.",
+                "artifact": "Program completion audit and nonclinical post-workshop skill check",
+                "limitation": "Fictional nonclinical educational data only; does not diagnose or treat mental health conditions.",
+            },
+            "connection_2": {
+                "subject": "English / Media Communication",
+                "concept": "Truthful Claims & Audience Accessibility in Flyers",
+                "business_use": "Writing clear, non-exaggerated workshop flyers with accessible formatting and verified claims.",
+                "artifact": "Reviewed workshop flyer draft in Marketing Studio",
+                "limitation": "Correlation between flyer distribution and sign-ups does not prove causation without a controlled experiment.",
+            },
+        },
+        "assumptions": [
+            "Fictional teaching baseline: $30/seat, 70 requested, 50 seat cap, $6 variable, $550 fixed.",
+            "Revenue is earned upon seat delivery; completion rate (80%) is tracked as a separate quality metric.",
+            "Forecast multipliers (1.00x / 1.10x / 0.90x) are scenario assumptions, not statistical confidence bounds.",
+        ],
+    }
+
+
+def init_session():
+    if "sim_state" not in st.session_state:
+        st.session_state.sim_state = get_default_state()
+
+
+# ---------------------------------------------------------------------------
+# Core Deterministic Simulation Engine
+# ---------------------------------------------------------------------------
+def compute_normal_capacity(staff_hours: float, hours_per_unit: float, program_seats: int) -> int:
+    if hours_per_unit <= 0:
+        return 0
+    staff_cap = math.floor(staff_hours / hours_per_unit)
+    return max(0, min(staff_cap, int(program_seats)))
+
+
+def run_simulation_step(
+    state: dict,
+    run_id: str,
+    sim_date: str,
+    requested: int,
+    capacity_override: int | None = None,
+    ad_cost_override: float | None = None,
+    mode_label: str = "Normal Mode",
+) -> tuple[bool, str]:
+    if not run_id or not run_id.strip():
+        return False, "Error: A unique run_id is required before running a step."
+    if run_id in state["processed_run_ids"]:
+        return False, f"Rejected duplicate run_id '{run_id}'. No new transactions were created."
+
+    inp = state["inputs"]
+    price = to_dec(inp["base_price"])
+    var_unit = sum(to_dec(v) for v in state["variable_costs"].values())
+    fixed_total = sum(to_dec(v) for v in state["fixed_costs"].values())
+
+    if capacity_override is not None:
+        capacity = max(0, int(capacity_override))
+    else:
+        capacity = compute_normal_capacity(inp["staff_hours"], inp["hours_per_unit"], inp["program_seats"])
+
+    req_int = max(0, int(requested))
+    sold = min(req_int, capacity)
+    unserved = max(0, req_int - sold)
+    completed = math.floor(sold * float(inp["completion_rate"]))
+
+    marketing = to_dec(ad_cost_override if ad_cost_override is not None else inp["own_marketing_cost"])
+    refunds = to_dec(inp["refund_amount"])
+    interest = to_dec(inp["interest_expense"])
+    principal = to_dec(inp["loan_principal"])
+    capex = to_dec(inp["additional_capex"])
+    new_owner = to_dec(inp["new_owner_cash"])
+    new_loan = to_dec(inp["new_loan_cash"])
+
+    gross_revenue = price * Decimal(sold)
+    net_revenue = gross_revenue - refunds
+    variable_expense = var_unit * Decimal(sold)
+    total_operating_expense = variable_expense + fixed_total + marketing
+    operating_profit = net_revenue - total_operating_expense
+    net_profit = operating_profit - interest
+
+    opening_cash = to_dec(state["cash_balance"])
+    ending_cash = (
+        opening_cash
+        + net_revenue
+        - variable_expense
+        - fixed_total
+        - marketing
+        - interest
+        - principal
+        - capex
+        + new_owner
+        + new_loan
+    )
+
+    new_version = state["state_version"] + 1
+    entry = {
+        "run_id": run_id,
+        "state_version": new_version,
+        "date": sim_date,
+        "mode": mode_label,
+        "requested": req_int,
+        "capacity": capacity,
+        "sold": sold,
+        "unserved_demand": unserved,
+        "completed_students": completed,
+        "satisfaction_mean": float(inp["satisfaction_mean"]),
+        "unit_price": float(price),
+        "revenue": float(net_revenue),
+        "variable_expense": float(variable_expense),
+        "fixed_expense": float(fixed_total),
+        "marketing_expense": float(marketing),
+        "total_expense": float(total_operating_expense),
+        "operating_profit": float(operating_profit),
+        "interest_expense": float(interest),
+        "net_profit": float(net_profit),
+        "opening_cash": float(opening_cash),
+        "ending_cash": float(ending_cash),
+    }
+
+    state["ledger"].append(entry)
+    state["processed_run_ids"].append(run_id)
+    state["cash_balance"] = f"{ending_cash:.2f}"
+    state["debt_balance"] = f"{(to_dec(state['debt_balance']) + new_loan - principal):.2f}"
+    state["state_version"] = new_version
+    state["simulation_date"] = sim_date
+    state["snapshot_id"] = f"SNAP-{new_version:03d}"
+
+    return True, f"Recorded run '{run_id}' (State v{new_version}). Closing cash: {fmt_money(ending_cash)}."
+
+
+# ---------------------------------------------------------------------------
+# Snapshot Export & Import Validation
+# ---------------------------------------------------------------------------
+def build_snapshot_json(state: dict) -> str:
+    payload = {
+        "exported_at_utc": datetime.now(timezone.utc).isoformat(),
+        **state,
+    }
+    return json.dumps(payload, indent=2)
+
+
+def validate_and_import_snapshot(raw_text: str, current_state: dict) -> tuple[bool, str, dict | None]:
+    try:
+        incoming = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        return False, f"Invalid JSON file: {exc}", None
+
+    required_keys = ["team_id", "course", "pathway_id", "state_version", "cash_balance", "inputs", "ledger"]
+    for key in required_keys:
+        if key not in incoming:
+            return False, f"Rejected import: missing required field '{key}'.", None
+
+    if incoming["team_id"] != current_state["team_id"]:
+        return (
+            False,
+            f"Rejected import: team_id '{incoming['team_id']}' does not match active team '{current_state['team_id']}'.",
+            None,
+        )
+
+    if int(incoming["state_version"]) < int(current_state["state_version"]):
+        return (
+            False,
+            f"Rejected stale snapshot: incoming version v{incoming['state_version']} is older than current v{current_state['state_version']}.",
+            None,
+        )
+
+    if to_dec(incoming["cash_balance"]) < 0:
+        return False, "Rejected import: negative cash balance is not permitted.", None
+
+    return True, f"Imported snapshot '{incoming.get('snapshot_id', 'N/A')}' at state v{incoming['state_version']}.", incoming
+
+
+# ---------------------------------------------------------------------------
+# UI Layout & Modules
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="Career Venture Lab | PSY-2", layout="wide")
+init_session()
+state = st.session_state.sim_state
+
+st.title("Career Venture Lab — Study Habits & Wellness Education Studio (PSY-2)")
+st.caption(
+    f"Team: **{state['team_id']}** | Course: **{state['course']}** | Level: **{state['selected_level']}** "
+    f"| Snapshot: **{state['snapshot_id']} (v{state['state_version']})** | Simulation Only (No Real Money)"
+)
+
+with st.sidebar:
+    st.header("Business Control & Save/Load")
+    st.metric("Spendable Cash in Bank", fmt_money(to_dec(state["cash_balance"])))
+    st.metric("Current State Version", f"v{state['state_version']}")
+
+    if st.button("Reset to Opening Post-Startup State ($3,000)", use_container_width=True):
+        st.session_state.sim_state = get_default_state()
+        st.rerun()
+
+    st.divider()
+    st.subheader("Save / Restore JSON")
+    st.download_button(
+        label="Download Snapshot JSON",
+        data=build_snapshot_json(state),
+        file_name=f"{state['team_id']}_{state['snapshot_id']}_v{state['state_version']}.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    uploaded_file = st.file_uploader("Restore / Import Snapshot JSON", type=["json"])
+    if uploaded_file is not None:
+        if st.button("Validate & Import File", use_container_width=True):
+            ok, msg, new_state = validate_and_import_snapshot(uploaded_file.read().decode("utf-8"), state)
+            if ok and new_state is not None:
+                st.session_state.sim_state = new_state
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+    st.divider()
+    st.subheader("Build Stage Status")
+    st.markdown(
+        "- **Stage 1 (Active):** Inputs, Math Panel, Ledger, Tests\n"
+        "- **Stage 2 (Active):** Report Center, Marketing Studio & Decision Memos\n"
+        "- **Stage 3 (Active):** Practice Assessments & Cross-Course Panel\n"
+        "- **Stage 4 (Optional):** Demonstration Storefront (Not Yet Built)"
+    )
+
+tabs = st.tabs(
+    [
+        "1. Overview & Inputs",
+        "2. Precalculus Math Panel",
+        "3. Ledger & Fixture Tests",
+        "4. Report Center & Decisions",
+        "5. Marketing Studio",
+        "6. Practice Quiz & Cross-Course",
+    ]
+)
+
+# ---------------------------------------------------------------------------
+# TAB 1: Overview & Editable Inputs
+# ---------------------------------------------------------------------------
+with tabs[0]:
+    st.subheader("Business Overview & Operating Rules")
+    col1, col2, col3, col4 = st.columns(4)
+    inp = state["inputs"]
+    var_unit = sum(to_dec(v) for v in state["variable_costs"].values())
+    fixed_total = sum(to_dec(v) for v in state["fixed_costs"].values())
+    norm_cap = compute_normal_capacity(inp["staff_hours"], inp["hours_per_unit"], inp["program_seats"])
+
+    col1.metric("Seat Price (p0)", fmt_money(to_dec(inp["base_price"])))
+    col2.metric("Monthly Seat Limit (Capacity)", f"{norm_cap} seats")
+    col3.metric("Cost per Student Sold", fmt_money(var_unit))
+    col4.metric("Monthly Fixed Bills", fmt_money(fixed_total))
+
+    st.info(
+        "**Plain-English Operating Rule:** You earn **$30** when a seat is delivered (`sold = min(requested, capacity)`). "
+        "Your **80% completion rate** tracks educational quality separately—students who do not finish do not trigger automatic refunds."
+    )
+
+    st.markdown("### Edit Business Inputs & Costs")
+    c_left, c_right = st.columns(2)
+
+    with c_left:
+        st.markdown("**Demand, Staffing & Room Limits**")
+        inp["base_price"] = st.number_input("Price per Program Seat ($)", min_value=1.0, value=float(inp["base_price"]), step=1.0)
+        inp["D0"] = st.number_input("Baseline Monthly Demand D0 (seats)", min_value=0, value=int(inp["D0"]), step=1)
+        inp["requested_demand"] = st.number_input("Current Month Requested Seats", min_value=0, value=int(inp["requested_demand"]), step=1)
+        inp["staff_hours"] = st.number_input("Facilitator Staff Hours / Month", min_value=0.0, value=float(inp["staff_hours"]), step=1.0)
+        inp["hours_per_unit"] = st.number_input("Staff Hours per Student Seat", min_value=0.1, value=float(inp["hours_per_unit"]), step=0.1)
+        inp["program_seats"] = st.number_input("Room Seat Limit / Month", min_value=0, value=int(inp["program_seats"]), step=1)
+        inp["completion_rate"] = st.slider("Program Completion Rate (Quality)", 0.0, 1.0, float(inp["completion_rate"]), 0.05)
+        inp["satisfaction_mean"] = st.slider("Survey Satisfaction Score (1-5)", 1.0, 5.0, float(inp["satisfaction_mean"]), 0.1)
+
+    with c_right:
+        st.markdown("**Variable Costs (Per Seat Delivered)**")
+        for k in state["variable_costs"]:
+            state["variable_costs"][k] = st.number_input(
+                f"{k.replace('_', ' ').title()} ($/seat)", min_value=0.0, value=float(state["variable_costs"][k]), step=0.5
+            )
+
+        st.markdown("**Fixed Monthly Bills**")
+        for k in state["fixed_costs"]:
+            state["fixed_costs"][k] = st.number_input(
+                f"{k.replace('_', ' ').title()} ($/month)", min_value=0.0, value=float(state["fixed_costs"][k]), step=10.0
+            )
+
+        inp["own_marketing_cost"] = st.number_input(
+            "Approved Monthly Ad Spend ($)", min_value=0.0, value=float(inp["own_marketing_cost"]), step=10.0
+        )
+
+    st.markdown("### Scenario Comparison (Projections Only — Not Recorded in Ledger)")
+    mults = {"Downside (0.90x)": 0.90, "Baseline (1.00x)": 1.00, "Upside (1.10x)": 1.10}
+    scen_rows = []
+    for label, m in mults.items():
+        req_s = math.floor(inp["requested_demand"] * m)
+        sold_s = min(req_s, norm_cap)
+        rev_s = Decimal(sold_s) * to_dec(inp["base_price"])
+        exp_s = (
+            Decimal(sold_s) * sum(to_dec(v) for v in state["variable_costs"].values())
+            + sum(to_dec(v) for v in state["fixed_costs"].values())
+            + to_dec(inp["own_marketing_cost"])
+        )
+        prof_s = rev_s - exp_s
+        scen_rows.append(
+            {
+                "Scenario (Assumed)": label,
+                "Projected Requests": req_s,
+                "Capped Seats Sold": sold_s,
+                "Projected Revenue": fmt_money(rev_s),
+                "Projected Expense": fmt_money(exp_s),
+                "Projected Operating Profit": fmt_money(prof_s),
+            }
+        )
+    st.dataframe(pd.DataFrame(scen_rows), use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------------------------
+# TAB 2: Persistent Precalculus Math Skills & Levels Panel
+# ---------------------------------------------------------------------------
+with tabs[1]:
+    st.subheader("Precalculus Math Skills & Challenge Level Panel")
+    level_choice = st.radio(
+        "Select Teacher-Approved Challenge Level:",
+        ["Foundation", "Applied", "Advanced"],
+        index=["Foundation", "Applied", "Advanced"].index(state["selected_level"]),
+        horizontal=True,
+    )
+    if level_choice != state["selected_level"]:
+        state["selected_level"] = level_choice
+        st.rerun()
+
+    p0 = float(inp["base_price"])
+    D0 = int(inp["D0"])
+    v = float(sum(to_dec(x) for x in state["variable_costs"].values()))
+    F = float(sum(to_dec(x) for x in state["fixed_costs"].values()))
+    cap = compute_normal_capacity(inp["staff_hours"], inp["hours_per_unit"], inp["program_seats"])
+
+    if level_choice == "Foundation":
+        st.markdown("#### Foundation: Average Cost as a Rational Function $A(s) = \\frac{F}{s} + v$")
+        st.write(
+            f"**Business Question:** How does the cost per student seat change as we fill more of our {cap} seats?\n\n"
+            f"**Equation:** $A(s) = \\frac{{{F:.0f}}}{{s}} + {v:.2f}$ | **Domain:** $0 < s \\le {cap}$ seats | "
+            f"**Vertical Asymptote:** $s = 0$ (undefined) | **Horizontal Asymptote:** $y = {v:.2f}$ ($/seat)"
+        )
+        s_vals = np.arange(1, max(2, cap + 1))
+        a_vals = F / s_vals + v
+        df_f = pd.DataFrame(
+            {"Seats Sold (s)": s_vals, "Total Cost C(s) ($)": F + v * s_vals, "Average Cost A(s) ($/seat)": np.round(a_vals, 2)}
+        )
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=s_vals, y=a_vals, mode="lines+markers", name="Average Cost A(s) ($/seat)"))
+        fig.add_hline(y=v, line_dash="dash", annotation_text=f"Horizontal Asymptote y = ${v:.2f}/seat")
+        fig.update_layout(
+            title=f"Average Cost per Seat A(s) | Snapshot {state['snapshot_id']} (Domain: 0 < s <= {cap})",
+            xaxis_title="Seats Sold (s)",
+            yaxis_title="Average Cost ($ per seat)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(df_f, use_container_width=True, hide_index=True)
+        st.download_button("Export Foundation Table (CSV)", df_f.to_csv(index=False), "psy2_foundation_avg_cost.csv", "text/csv")
+        st.warning("**Interpretation Prompt:** Why is $s = 0$ excluded from the domain, and what happens to average cost near $s = 0$?")
+
+    elif level_choice == "Applied":
+        st.markdown("#### Applied: Composing Demand, Capacity, Revenue & Cost Functions")
+        b_slope = D0 / p0 if p0 > 0 else 0
+        p_break = p0 * (2.0 - cap / D0) if D0 > 0 else 0
+        st.write(
+            f"**Equations:** $q(p) = \\max(0, {2*D0} - {b_slope:.4f}p)$ on $0 \\le p \\le {2*p0:.0f}$ | "
+            f"$s(p) = \\min({cap}, q(p))$ | $R(p) = p \\cdot s(p)$ | $C(s(p)) = {F:.0f} + {v:.2f}s(p)$\n\n"
+            f"**Capacity Breakpoint Price:** $p = {p0:.0f}(2 - {cap}/{D0}) = \\${p_break:.2f}$ (below this price, seat capacity caps sales at {cap})."
+        )
+        p_grid = np.linspace(0, 2 * p0, 61)
+        q_grid = np.maximum(0.0, 2 * D0 - b_slope * p_grid)
+        s_cont = np.minimum(float(cap), q_grid)
+        s_int = np.floor(s_cont)
+        prof_cont = p_grid * s_cont - (F + v * s_cont)
+        prof_int = p_grid * s_int - (F + v * s_int)
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=p_grid, y=prof_cont, mode="lines", name="Continuous Profit Model ($)"))
+        fig.add_trace(go.Scatter(x=p_grid, y=prof_int, mode="lines", line=dict(dash="dot"), name="Integer-Seat Profit ($)"))
+        fig.add_hline(y=0, line_dash="dash", annotation_text="Break-Even Zero Line")
+        fig.add_vline(x=p_break, line_dash="dashdot", annotation_text=f"Capacity Breakpoint (${p_break:.2f})")
+        fig.update_layout(
+            title=f"Composed Profit P(p) with Capacity Cap ({cap} seats) | Snapshot {state['snapshot_id']}",
+            xaxis_title="Seat Price p ($)",
+            yaxis_title="Monthly Operating Profit ($)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        df_a = pd.DataFrame(
+            {
+                "Price p ($)": np.round(p_grid[::5], 2),
+                "Unconstrained Demand q(p)": np.round(q_grid[::5], 2),
+                "Continuous Seats s(p)": np.round(s_cont[::5], 2),
+                "Rounded Integer Seats": s_int[::5].astype(int),
+                "Continuous Profit ($)": np.round(prof_cont[::5], 2),
+                "Integer Profit ($)": np.round(prof_int[::5], 2),
+            }
+        )
+        st.dataframe(df_a, use_container_width=True, hide_index=True)
+        st.download_button("Export Applied Table (CSV)", df_a.to_csv(index=False), "psy2_applied_composition.csv", "text/csv")
+        st.warning(
+            "**Interpretation Prompt:** Why does the profit formula change slope at the capacity breakpoint price, and how do whole-seat transactions differ from the smooth curve?"
+        )
+
+    else:
+        st.markdown("#### Advanced: Seasonal Demand Wave $D(t) = D_0\\left(1 + 0.20\\sin\\left(\\frac{2\\pi(t-1)}{12}\\right)\\right)$")
+        st.write(
+            f"**Assumed Seasonal Model (12-Month Period):** Peaks in Month $t = 4$ at $1.20 \\times {D0} = {1.2*D0:.1f}$ seats "
+            f"and hits its low in Month $t = 10$ at $0.80 \\times {D0} = {0.8*D0:.1f}$ seats. Realized sales clip at your **{cap}-seat** limit."
+        )
+        months = np.arange(1, 13)
+        d_t = D0 * (1.0 + 0.20 * np.sin(2.0 * np.pi * (months - 1) / 12.0))
+        s_t = np.minimum(float(cap), np.floor(d_t))
+        unserved_t = np.maximum(0.0, np.floor(d_t) - s_t)
+        prof_t = s_t * p0 - (F + v * s_t)
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=months, y=d_t, mode="lines+markers", name="Seasonal Demand D(t)"))
+        fig.add_trace(go.Bar(x=months, y=s_t, name="Realized Seats Sold (Capped)", opacity=0.6))
+        fig.add_hline(y=cap, line_dash="dash", annotation_text=f"Seat Capacity Limit ({cap})")
+        fig.update_layout(
+            title=f"12-Month Seasonal Demand vs. Realized Sales | Snapshot {state['snapshot_id']}",
+            xaxis_title="Month Index t (1 to 12)",
+            yaxis_title="Program Seats",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        df_adv = pd.DataFrame(
+            {
+                "Month (t)": months,
+                "Seasonal Demand D(t)": np.round(d_t, 2),
+                "Floored Demand": np.floor(d_t).astype(int),
+                "Realized Sold (Capped)": s_t.astype(int),
+                "Unserved Demand": unserved_t.astype(int),
+                "Monthly Operating Profit ($)": np.round(prof_t, 2),
+            }
+        )
+        st.dataframe(df_adv, use_container_width=True, hide_index=True)
+        st.download_button("Export Advanced Seasonal Table (CSV)", df_adv.to_csv(index=False), "psy2_advanced_seasonal.csv", "text/csv")
+        st.warning(
+            "**Extrapolation & Model Limitation:** This seasonal wave is a teaching assumption for 12 months. "
+            "Because capacity caps sales at 50 seats in every month, even the Month 10 trough (56 requested) still fills all 50 seats unless capacity drops."
+        )
+
+# ---------------------------------------------------------------------------
+# TAB 3: Record Book (Ledger) & Fixture Acceptance Tests
+# ---------------------------------------------------------------------------
+with tabs[2]:
+    st.subheader("Business Record Book (Dated Event Ledger)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        run_id_input = st.text_input("Unique Run ID", value=f"RUN-{state['state_version']:03d}")
+    with c2:
+        sim_date_input = st.text_input("Simulation Date (YYYY-MM-DD)", value="2027-01-31")
+    with c3:
+        if st.button("Approve & Record Current Month", type="primary", use_container_width=True):
+            ok, msg = run_simulation_step(
+                state,
+                run_id=run_id_input,
+                sim_date=sim_date_input,
+                requested=int(inp["requested_demand"]),
+                mode_label="Normal Mode",
+            )
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+    st.divider()
+    st.markdown("### Fixture-Test Mode (Handbook Verification)")
+    st.warning(
+        "**Fixture-Test Mode Warning:** Replaying `sample_data/monthly_fixture.csv` resets to opening cash ($3,000) and uses "
+        "supplied `capacity_override` values to verify ledger math against the handbook."
+    )
+    if st.button("Replay 3-Month PSY-2 Fixture & Verify Results"):
+        st.session_state.sim_state = get_default_state()
+        s = st.session_state.sim_state
+        fixture_rows = [
+            ("FIX-2027-01", "2027-01-31", 70, 50, 0.0),
+            ("FIX-2027-02", "2027-02-28", 77, 50, 100.0),
+            ("FIX-2027-03", "2027-03-31", 63, 37, 0.0),
+        ]
+        for rid, dt, req, cap_ov, ad in fixture_rows:
+            run_simulation_step(s, rid, dt, req, capacity_override=cap_ov, ad_cost_override=ad, mode_label="Fixture-Test Mode")
+        st.success("Fixture replay complete! Check the ledger below: closing cash should be $3,650.00, $4,200.00, and $4,538.00.")
+        st.rerun()
+
+    if state["ledger"]:
+        df_ledger = pd.DataFrame(state["ledger"])
+        st.dataframe(df_ledger, use_container_width=True, hide_index=True)
+        st.download_button("Export Ledger (CSV)", df_ledger.to_csv(index=False), "psy2_ledger.csv", "text/csv")
+    else:
+        st.info("No transactions recorded yet. Approve a month above or run the 3-month fixture test.")
+
+# ---------------------------------------------------------------------------
+# TAB 4: Report Center & Student Decision Memo (Stage 2)
+# ---------------------------------------------------------------------------
+with tabs[3]:
+    st.subheader("Report Center (Reconciled to Approved Ledger)")
+    st.caption(
+        f"Team: {state['team_id']} | Snapshot: {state['snapshot_id']} (v{state['state_version']}) | "
+        "Status: Actual Recorded Ledger (Viewing reports does not create transactions)"
+    )
+
+    if not state["ledger"]:
+        st.info("Record at least one month (or run the 3-month fixture in Tab 3) to populate your financial and operations reports.")
+    else:
+        df_l = pd.DataFrame(state["ledger"])
+        tot_rev = to_dec(df_l["revenue"].sum())
+        tot_var = to_dec(df_l["variable_expense"].sum())
+        tot_fix = to_dec(df_l["fixed_expense"].sum())
+        tot_mkt = to_dec(df_l["marketing_expense"].sum())
+        tot_int = to_dec(df_l["interest_expense"].sum())
+        gross_profit = tot_rev - tot_var
+        op_profit = gross_profit - tot_fix - tot_mkt
+        net_profit = op_profit - tot_int
+
+        r1, r2, r3 = st.columns(3)
+        with r1:
+            st.markdown("#### 1. Income Statement (Cumulative)")
+            inc_df = pd.DataFrame(
+                [
+                    {"Line Item": "Sales Revenue (Delivered Seats)", "Amount": fmt_money(tot_rev)},
+                    {"Line Item": "Less: Variable Delivery Costs", "Amount": fmt_money(-tot_var)},
+                    {"Line Item": "Gross Profit", "Amount": fmt_money(gross_profit)},
+                    {"Line Item": "Less: Fixed Monthly Bills", "Amount": fmt_money(-tot_fix)},
+                    {"Line Item": "Less: Approved Marketing Spend", "Amount": fmt_money(-tot_mkt)},
+                    {"Line Item": "Operating Profit", "Amount": fmt_money(op_profit)},
+                    {"Line Item": "Less: Interest Expense", "Amount": fmt_money(-tot_int)},
+                    {"Line Item": "Net Result", "Amount": fmt_money(net_profit)},
+                ]
+            )
+            st.dataframe(inc_df, use_container_width=True, hide_index=True)
+
+        with r2:
+            st.markdown("#### 2. Cash-Flow Summary")
+            open_cash = to_dec(state["startup"]["opening_cash"])
+            close_cash = to_dec(state["cash_balance"])
+            cf_df = pd.DataFrame(
+                [
+                    {"Cash Flow Item": "Opening Post-Startup Cash", "Amount": fmt_money(open_cash)},
+                    {"Cash Flow Item": "Net Operating Cash Inflow", "Amount": fmt_money(close_cash - open_cash)},
+                    {"Cash Flow Item": "Closing Spendable Cash", "Amount": fmt_money(close_cash)},
+                    {"Cash Flow Item": "Minimum Cash Safety Flag ($600)", "Amount": "OK" if close_cash >= 600 else "LOW CASH WARNING"},
+                ]
+            )
+            st.dataframe(cf_df, use_container_width=True, hide_index=True)
+
+        with r3:
+            st.markdown("#### 3. Simplified Balance Sheet")
+            equip = to_dec(state["startup"]["equipment_assets"])
+            total_assets = close_cash + equip
+            debt = to_dec(state["debt_balance"])
+            owner_eq = to_dec(state["startup"]["owner_contribution"])
+            ret_earn = to_dec(state["startup"]["retained_earnings"]) + net_profit
+            bs_df = pd.DataFrame(
+                [
+                    {"Account": "Cash in Bank", "Amount": fmt_money(close_cash)},
+                    {"Account": "Equipment Assets (Gross, No Depr.)", "Amount": fmt_money(equip)},
+                    {"Account": "Total Assets", "Amount": fmt_money(total_assets)},
+                    {"Account": "Debt / Loans Payable", "Amount": fmt_money(debt)},
+                    {"Account": "Owner Contribution", "Amount": fmt_money(owner_eq)},
+                    {"Account": "Retained Earnings (-$1,300 + Net)", "Amount": fmt_money(ret_earn)},
+                    {"Account": "Total Liabilities + Equity", "Amount": fmt_money(debt + owner_eq + ret_earn)},
+                ]
+            )
+            st.dataframe(bs_df, use_container_width=True, hide_index=True)
+
+        st.markdown("#### 4. Operations & Quality Summary")
+        ops_df = df_l[["date", "requested", "capacity", "sold", "unserved_demand", "completed_students", "satisfaction_mean"]].copy()
+        ops_df["utilization_pct"] = np.where(ops_df["capacity"] > 0, np.round(100 * ops_df["sold"] / ops_df["capacity"], 1), np.nan)
+        st.dataframe(ops_df, use_container_width=True, hide_index=True)
+        st.download_button("Download Full Operations & Financial CSV", df_l.to_csv(index=False), "psy2_full_report.csv", "text/csv")
+
+    st.divider()
+    st.markdown("### Student Decision Memo (Required After Every Business Round)")
+    with st.form("decision_memo_form"):
+        d_question = st.text_input("Business Question (e.g., Should we raise seat price from $30 to $33?)")
+        d_reports = st.multiselect(
+            "Cite at least TWO reports reviewed:",
+            ["Income Statement", "Cash-Flow Summary", "Simplified Balance Sheet", "Operations & Quality Report", "Precalculus Math Panel"],
+            default=["Income Statement", "Operations & Quality Report"],
+        )
+        d_alternatives = st.text_area("Compare Baseline vs. Two Alternatives (include your Precalculus check):")
+        d_action = st.text_input("Chosen Student-Approved Action:")
+        d_prediction = st.text_input("Measurable Outcome Prediction:")
+        col_o, col_c = st.columns(2)
+        with col_o:
+            d_owner = st.text_input("Student Owner Name:")
+        with col_c:
+            d_checker = st.text_input("Independent Student Checker Name:")
+        if st.form_submit_button("Save Approved Decision Memo"):
+            if len(d_reports) < 2 or not d_question or not d_owner or not d_checker:
+                st.error("Please fill out the question, cite at least TWO reports, and name both an owner and an independent student checker.")
+            else:
+                state["decisions"].append(
+                    {
+                        "decision_id": f"DEC-{len(state['decisions']) + 1:02d}",
+                        "snapshot_id": state["snapshot_id"],
+                        "state_version": state["state_version"],
+                        "question": d_question,
+                        "reports_cited": d_reports,
+                        "alternatives": d_alternatives,
+                        "chosen_action": d_action,
+                        "prediction": d_prediction,
+                        "owner": d_owner,
+                        "checker": d_checker,
+                        "approval": "Approved by Student Team",
+                    }
+                )
+                st.success("Decision Memo saved to snapshot!")
+
+    if state["decisions"]:
+        st.dataframe(pd.DataFrame(state["decisions"]), use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------------------------
+# TAB 5: Costed Marketing Studio (Stage 2)
+# ---------------------------------------------------------------------------
+with tabs[4]:
+    st.subheader("Marketing Studio (Advertising Has a Real Cost)")
+    st.info(
+        "**Rule:** Drafting flyers or ads is free until you approve and launch a campaign. Launching records the itemized campaign expense "
+        "**once** using a unique `campaign_id`—never automatically inflating demand without your explicit review."
+    )
+
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        camp_id = st.text_input("Unique Campaign ID", value=f"CAMP-{len(state['campaigns']) + 1:02d}")
+        offering = st.selectbox(
+            "Workshop Offering",
+            ["Study-strategy workshop", "Time-management seminar", "General stress-awareness education"],
+        )
+        audience = st.text_input("Target Audience", value="High school students preparing for semester exams")
+        channel = st.selectbox("Channel", ["Printed school flyer", "Email newsletter", "Campus social post", "Digital banner"])
+        headline = st.text_input("Approved Truthful Headline", value="Build Practical Study Habits Before Finals — $30 Seat")
+        body_copy = st.text_area(
+            "Flyer / Ad Copy (Nonclinical Educational Claims Only)",
+            value="Join our 30-minute Study-Strategy Workshop. Learn structured note-taking and time-blocking skills. Fictional contact: studio@example.edu",
+        )
+        nonclinical_checked = st.checkbox("Student Fact-Check: Verified no medical/clinical claims and fictional contact info used")
+
+    with mc2:
+        st.markdown("**Itemized Campaign Budget**")
+        design_hrs = st.number_input("Design Labor Hours (in-kind or paid)", min_value=0.0, value=2.0, step=0.5)
+        hourly_rate = st.number_input("Design Hourly Rate ($/hr)", min_value=0.0, value=15.0, step=1.0)
+        assets_cost = st.number_input("Licensed Graphics / Assets ($)", min_value=0.0, value=10.0, step=5.0)
+        print_qty = st.number_input("Print Quantity (flyers)", min_value=0, value=100, step=10)
+        print_unit = st.number_input("Print Cost per Flyer ($)", min_value=0.0, value=0.25, step=0.05)
+        dist_cost = st.number_input("Distribution Cost ($)", min_value=0.0, value=15.0, step=5.0)
+        place_cost = st.number_input("Ad Placement Cost ($)", min_value=0.0, value=20.0, step=5.0)
+        expected_inquiries = st.number_input("Assumed Inquiries (Simulation Assumption)", min_value=0, value=25, step=1)
+        expected_conversions = st.number_input("Assumed Enrolled Seats (Conversions)", min_value=0, value=5, step=1)
+
+        total_camp_cost = (
+            to_dec(design_hrs) * to_dec(hourly_rate)
+            + to_dec(assets_cost)
+            + Decimal(print_qty) * to_dec(print_unit)
+            + to_dec(dist_cost)
+            + to_dec(place_cost)
+        )
+        st.metric("Total Itemized Campaign Cost", fmt_money(total_camp_cost))
+        if expected_conversions > 0:
+            cac = total_camp_cost / Decimal(expected_conversions)
+            st.write(f"**Estimated Acquisition Cost per Enrollee:** {fmt_money(cac)}")
+        else:
+            st.write("**Estimated Acquisition Cost per Enrollee:** `N/A` (0 conversions — division by zero avoided)")
+
+    st.markdown("#### Printable Flyer Preview")
+    flyer_text = (
+        f"=== {offering.upper()} ===\n"
+        f"{headline}\n\n"
+        f"{body_copy}\n\n"
+        f"Audience: {audience} | Channel: {channel} | Campaign ID: {camp_id}\n"
+        f"[DEMONSTRATION SIMULATION — NO REAL SALES OR CLINICAL ADVICE]"
+    )
+    st.code(flyer_text, language="text")
+
+    if st.button("Approve & Launch Campaign Simulation (Record Cost Once)", type="primary"):
+        if not nonclinical_checked:
+            st.error("Please check the Student Fact-Check box before launching.")
+        elif camp_id in state["launched_campaign_ids"]:
+            st.error(f"Rejected: Campaign '{camp_id}' has already been launched and expensed once.")
+        else:
+            state["launched_campaign_ids"].append(camp_id)
+            state["inputs"]["own_marketing_cost"] = float(to_dec(state["inputs"]["own_marketing_cost"]) + total_camp_cost)
+            state["campaigns"].append(
+                {
+                    "campaign_id": camp_id,
+                    "snapshot_id": state["snapshot_id"],
+                    "offering": offering,
+                    "channel": channel,
+                    "total_cost": float(total_camp_cost),
+                    "assumed_conversions": expected_conversions,
+                    "cac": fmt_money(total_camp_cost / Decimal(expected_conversions)) if expected_conversions > 0 else "N/A",
+                    "status": "Launched (Pending Next Month Run)",
+                }
+            )
+            st.success(
+                f"Campaign '{camp_id}' approved! Added {fmt_money(total_camp_cost)} to Approved Monthly Ad Spend on Tab 1."
+            )
+            st.rerun()
+
+    if state["campaigns"]:
+        st.dataframe(pd.DataFrame(state["campaigns"]), use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------------------------
+# TAB 6: Snapshot Practice Quiz & Cross-Course Connections (Stage 3)
+# ---------------------------------------------------------------------------
+with tabs[5]:
+    col_q, col_cc = st.columns([3, 2])
+
+    with col_q:
+        st.subheader("Practice Assessment (Frozen Snapshot)")
+        st.caption("Generates practice questions using deterministic math from your current snapshot. Graded keys remain teacher-controlled.")
+
+        if st.button("Freeze Current Snapshot for Practice Quiz"):
+            p_cur = float(inp["base_price"])
+            D0_cur = int(inp["D0"])
+            F_cur = float(sum(to_dec(x) for x in state["fixed_costs"].values()))
+            v_cur = float(sum(to_dec(x) for x in state["variable_costs"].values()))
+            cap_cur = compute_normal_capacity(inp["staff_hours"], inp["hours_per_unit"], inp["program_seats"])
+            st.session_state.frozen_quiz = {
+                "snapshot_id": state["snapshot_id"],
+                "state_version": state["state_version"],
+                "p0": p_cur,
+                "D0": D0_cur,
+                "F": F_cur,
+                "v": v_cur,
+                "cap": cap_cur,
+                "completion_rate": float(inp["completion_rate"]),
+            }
+
+        fq = st.session_state.get("frozen_quiz")
+        if fq:
+            st.info(f"Frozen Record: **{fq['snapshot_id']} (v{fq['state_version']})** — Changing sliders on Tab 1 will not alter these questions.")
+            ans_1_exact = fq["F"] / fq["cap"] + fq["v"] if fq["cap"] > 0 else 0.0
+            st.markdown(f"**Question 1 (Precalculus Rational Function):** Using $A(s) = \\frac{{{fq['F']:.0f}}}{{s}} + {fq['v']:.2f}$, compute the average cost per seat (in $) when operating at full capacity ($s = {fq['cap']}$ seats).")
+            u1 = st.number_input("Your Answer for Q1 ($/seat):", min_value=0.0, value=0.0, step=0.01, key="q1_ans")
+
+            ans_2_exact = fq["D0"] * 1.20
+            st.markdown(f"**Question 2 (Seasonal Trigonometric Model):** For $D(t) = {fq['D0']}\\left(1 + 0.20\\sin\\left(\\frac{{2\\pi(t-1)}}{{12}}\\right)\\right)$, what is the peak unconstrained demand at Month $t = 4$, and how many seats actually sell after the {fq['cap']}-seat capacity cap?")
+            u2 = st.number_input("Your Answer for Peak Demand D(4) (seats):", min_value=0.0, value=0.0, step=1.0, key="q2_ans")
+
+            st.markdown("**Question 3 (Reasoning & Cross-Course Check):** If survey satisfaction rises from 4.2 to 4.9 out of 5, why does our model NOT automatically increase revenue or demand?")
+            u3 = st.text_area("Your Short Explanation:", key="q3_ans")
+
+            if st.button("Check Practice Answers & Reveal Worked Solutions"):
+                q1_ok = abs(u1 - ans_1_exact) <= 0.02
+                q2_ok = abs(u2 - ans_2_exact) <= 0.01
+                st.write(f"**Q1 Result:** {'PASS' if q1_ok else 'CHECK WORK'} — Exact: **${ans_1_exact:.2f}/seat** (`{fq['F']:.0f} / {fq['cap']} + {fq['v']:.2f}`).")
+                st.write(f"**Q2 Result:** {'PASS' if q2_ok else 'CHECK WORK'} — Exact Peak $D(4)$: **{ans_2_exact:.1f} seats** (`{fq['D0']} * 1.20`), clipped to **{min(fq['cap'], int(ans_2_exact))} seats sold**.")
+                st.write("**Q3 Scoring Guide:** Strong answers note that (1) self-reported satisfaction is separate from demonstrated learning/completion, (2) revenue is earned strictly from delivered seats (`price * sold`), and (3) demand changes require verified evidence rather than automatic assumptions.")
+        else:
+            st.write("Click **Freeze Current Snapshot for Practice Quiz** above to generate questions.")
+
+    with col_cc:
+        st.subheader("Cross-Course Connections Panel")
+        for key, item in state["cross_course"].items():
+            with st.container(border=True):
+                st.markdown(f"**{item['subject']}**")
+                st.write(f"**Concept:** {item['concept']}")
+                st.write(f"**Business Use:** {item['business_use']}")
+                st.write(f"**Artifact:** {item['artifact']}")
+                st.caption(f"Limitation: {item['limitation']}")
